@@ -761,15 +761,16 @@ func (s *Server) serveAgent(ctx *srv.ServerContext) error {
 	}
 
 	// start an agent on a unix socket
-	agentServer := &teleagent.AgentServer{Agent: ctx.GetAgent()}
+	agentServer := &teleagent.AgentServer{Agent: ctx.Parent.GetAgent()}
 	err = agentServer.ListenUnixSocket(socketPath, uid, gid, 0600)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	ctx.SetEnv(teleport.SSHAuthSock, socketPath)
-	ctx.SetEnv(teleport.SSHAgentPID, fmt.Sprintf("%v", pid))
-	ctx.AddCloser(agentServer)
-	ctx.AddCloser(dirCloser)
+	ctx.Parent.SetEnv(teleport.SSHAuthSock, socketPath)
+	ctx.Parent.SetEnv(teleport.SSHAgentPID, fmt.Sprintf("%v", pid))
+	ctx.Parent.AddCloser(agentServer)
+	ctx.Parent.AddCloser(dirCloser)
+	ctx.SyncParentEnv()
 	ctx.Debugf("Opened agent channel for Teleport user %v and socket %v.", ctx.Identity.TeleportUser, socketPath)
 	go agentServer.Serve()
 
@@ -816,7 +817,7 @@ func (s *Server) HandleRequest(r *ssh.Request) {
 }
 
 // HandleNewChan is called when new channel is opened
-func (s *Server) HandleNewChan(wconn net.Conn, sconn *ssh.ServerConn, nch ssh.NewChannel) {
+func (s *Server) HandleNewChan(ccx *sshutils.ConnectionContext, wconn net.Conn, sconn *ssh.ServerConn, nch ssh.NewChannel) {
 	identityContext, err := s.authHandlers.CreateIdentityContext(sconn)
 	if err != nil {
 		nch.Reject(ssh.Prohibited, fmt.Sprintf("Unable to create identity from connection: %v", err))
@@ -841,7 +842,7 @@ func (s *Server) HandleNewChan(wconn net.Conn, sconn *ssh.ServerConn, nch ssh.Ne
 				nch.Reject(ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err))
 				return
 			}
-			go s.handleProxyJump(wconn, sconn, identityContext, ch, *req)
+			go s.handleProxyJump(ccx, wconn, sconn, identityContext, ch, *req)
 			return
 		// Channels of type "session" handle requests that are involved in running
 		// commands on a server. In the case of proxy mode subsystem and agent
@@ -853,7 +854,7 @@ func (s *Server) HandleNewChan(wconn net.Conn, sconn *ssh.ServerConn, nch ssh.Ne
 				nch.Reject(ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err))
 				return
 			}
-			go s.handleSessionRequests(wconn, sconn, identityContext, ch, requests)
+			go s.handleSessionRequests(ccx, wconn, sconn, identityContext, ch, requests)
 			return
 		default:
 			nch.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %v", channelType))
@@ -871,7 +872,7 @@ func (s *Server) HandleNewChan(wconn net.Conn, sconn *ssh.ServerConn, nch ssh.Ne
 			nch.Reject(ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err))
 			return
 		}
-		go s.handleSessionRequests(wconn, sconn, identityContext, ch, requests)
+		go s.handleSessionRequests(ccx, wconn, sconn, identityContext, ch, requests)
 	// Channels of type "direct-tcpip" handles request for port forwarding.
 	case teleport.ChanDirectTCPIP:
 		req, err := sshutils.ParseDirectTCPIPReq(nch.ExtraData())
@@ -886,17 +887,17 @@ func (s *Server) HandleNewChan(wconn net.Conn, sconn *ssh.ServerConn, nch ssh.Ne
 			nch.Reject(ssh.ConnectionFailed, fmt.Sprintf("unable to accept channel: %v", err))
 			return
 		}
-		go s.handleDirectTCPIPRequest(wconn, sconn, identityContext, ch, req)
+		go s.handleDirectTCPIPRequest(ccx, wconn, sconn, identityContext, ch, req)
 	default:
 		nch.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %v", channelType))
 	}
 }
 
 // handleDirectTCPIPRequest handles port forwarding requests.
-func (s *Server) handleDirectTCPIPRequest(wconn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, channel ssh.Channel, req *sshutils.DirectTCPIPReq) {
+func (s *Server) handleDirectTCPIPRequest(ccx *sshutils.ConnectionContext, wconn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, channel ssh.Channel, req *sshutils.DirectTCPIPReq) {
 	// Create context for this channel. This context will be closed when
 	// forwarding is complete.
-	ctx, err := srv.NewServerContext(s, sconn, identityContext)
+	ctx, err := srv.NewServerContext(s, sconn, identityContext, ccx)
 	if err != nil {
 		log.Errorf("Unable to create connection context: %v.", err)
 		channel.Stderr().Write([]byte("Unable to create connection context."))
@@ -996,10 +997,11 @@ func (s *Server) handleDirectTCPIPRequest(wconn net.Conn, sconn *ssh.ServerConn,
 // handleSessionRequests handles out of band session requests once the session
 // channel has been created this function's loop handles all the "exec",
 // "subsystem" and "shell" requests.
-func (s *Server) handleSessionRequests(conn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, ch ssh.Channel, in <-chan *ssh.Request) {
+func (s *Server) handleSessionRequests(ccx *sshutils.ConnectionContext, conn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, ch ssh.Channel, in <-chan *ssh.Request) {
 	// Create context for this channel. This context will be closed when the
 	// session request is complete.
-	ctx, err := srv.NewServerContext(s, sconn, identityContext)
+	log.Infof("Starting session request handler for %v", conn.RemoteAddr())
+	ctx, err := srv.NewServerContext(s, sconn, identityContext, ccx)
 	if err != nil {
 		log.Errorf("Unable to create connection context: %v.", err)
 		ch.Stderr().Write([]byte("Unable to create connection context."))
@@ -1171,7 +1173,7 @@ func (s *Server) handleAgentForwardNode(req *ssh.Request, ctx *srv.ServerContext
 	}
 
 	// save the agent in the context so it can be used later
-	ctx.SetAgent(agent.NewClient(authChannel), authChannel)
+	ctx.Parent.SetAgent(agent.NewClient(authChannel), authChannel)
 
 	// serve an agent on a unix socket on this node
 	err = s.serveAgent(ctx)
@@ -1209,7 +1211,7 @@ func (s *Server) handleAgentForwardProxy(req *ssh.Request, ctx *srv.ServerContex
 	// Save the agent so it can be used when making a proxy subsystem request
 	// later. It will also be used when building a remote connection to the
 	// target node.
-	ctx.SetAgent(agent.NewClient(authChannel), authChannel)
+	ctx.Parent.SetAgent(agent.NewClient(authChannel), authChannel)
 
 	return nil
 }
@@ -1304,10 +1306,10 @@ func (s *Server) handleVersionRequest(req *ssh.Request) {
 }
 
 // handleProxyJump handles ProxyJump request that is executed via direct tcp-ip dial on the proxy
-func (s *Server) handleProxyJump(conn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, ch ssh.Channel, req sshutils.DirectTCPIPReq) {
+func (s *Server) handleProxyJump(ccx *sshutils.ConnectionContext, conn net.Conn, sconn *ssh.ServerConn, identityContext srv.IdentityContext, ch ssh.Channel, req sshutils.DirectTCPIPReq) {
 	// Create context for this channel. This context will be closed when the
 	// session request is complete.
-	ctx, err := srv.NewServerContext(s, sconn, identityContext)
+	ctx, err := srv.NewServerContext(s, sconn, identityContext, ccx)
 	if err != nil {
 		log.Errorf("Unable to create connection context: %v.", err)
 		ch.Stderr().Write([]byte("Unable to create connection context."))

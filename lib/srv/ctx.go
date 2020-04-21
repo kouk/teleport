@@ -174,6 +174,8 @@ type ServerContext struct {
 
 	sync.RWMutex
 
+	Parent *sshutils.ConnectionContext
+
 	// env is a list of environment variables passed to the session.
 	env map[string]string
 
@@ -187,10 +189,10 @@ type ServerContext struct {
 	term Terminal
 
 	// agent is a client to remote SSH agent.
-	agent agent.Agent
+	//agent agent.Agent
 
 	// agentCh is SSH channel using SSH agent protocol.
-	agentChannel ssh.Channel
+	//agentChannel ssh.Channel
 
 	// session holds the active session (if there's an active one).
 	session *session
@@ -291,7 +293,7 @@ type ServerContext struct {
 
 // NewServerContext creates a new *ServerContext which is used to pass and
 // manage resources.
-func NewServerContext(srv Server, conn *ssh.ServerConn, identityContext IdentityContext) (*ServerContext, error) {
+func NewServerContext(srv Server, conn *ssh.ServerConn, identityContext IdentityContext, parent *sshutils.ConnectionContext) (*ServerContext, error) {
 	clusterConfig, err := srv.GetAccessPoint().GetClusterConfig()
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -300,6 +302,7 @@ func NewServerContext(srv Server, conn *ssh.ServerConn, identityContext Identity
 	cancelContext, cancel := context.WithCancel(context.TODO())
 
 	ctx := &ServerContext{
+		Parent:            parent,
 		id:                int(atomic.AddInt32(&ctxID, int32(1))),
 		env:               make(map[string]string),
 		srv:               srv,
@@ -373,6 +376,9 @@ func NewServerContext(srv Server, conn *ssh.ServerConn, identityContext Identity
 	}
 	ctx.AddCloser(ctx.contr)
 	ctx.AddCloser(ctx.contw)
+
+	// gather environment variables from parent.
+	ctx.SyncParentEnv()
 
 	return ctx, nil
 }
@@ -449,20 +455,22 @@ func (c *ServerContext) AddCloser(closer io.Closer) {
 
 // GetAgent returns a agent.Agent which represents the capabilities of an SSH agent.
 func (c *ServerContext) GetAgent() agent.Agent {
-	c.RLock()
-	defer c.RUnlock()
-	return c.agent
+	if c.Parent == nil {
+		return nil
+	}
+	return c.Parent.GetAgent()
 }
 
 // GetAgentChannel returns the channel over which communication with the agent occurs.
 func (c *ServerContext) GetAgentChannel() ssh.Channel {
-	c.RLock()
-	defer c.RUnlock()
-	return c.agentChannel
+	if c.Parent == nil {
+		return nil
+	}
+	return c.Parent.GetAgentChannel()
 }
 
 // SetAgent sets the agent and channel over which communication with the agent occurs.
-func (c *ServerContext) SetAgent(a agent.Agent, channel ssh.Channel) {
+/*func (c *ServerContext) SetAgent(a agent.Agent, channel ssh.Channel) {
 	c.Lock()
 	defer c.Unlock()
 	if c.agentChannel != nil {
@@ -471,7 +479,7 @@ func (c *ServerContext) SetAgent(a agent.Agent, channel ssh.Channel) {
 	}
 	c.agentChannel = channel
 	c.agent = a
-}
+}*/
 
 // GetTerm returns a Terminal.
 func (c *ServerContext) GetTerm() Terminal {
@@ -500,6 +508,15 @@ func (c *ServerContext) GetEnv(key string) (string, bool) {
 	return val, ok
 }
 
+// SyncParentEnv is used to re-synchronize env vars after
+// parent context has been updated.
+func (c *ServerContext) SyncParentEnv() {
+	if c.Parent == nil {
+		return
+	}
+	c.Parent.ApplyEnv(c.env)
+}
+
 // takeClosers returns all resources that should be closed and sets the properties to null
 // we do this to avoid calling Close() under lock to avoid potential deadlocks
 func (c *ServerContext) takeClosers() []io.Closer {
@@ -512,10 +529,10 @@ func (c *ServerContext) takeClosers() []io.Closer {
 		closers = append(closers, c.term)
 		c.term = nil
 	}
-	if c.agentChannel != nil {
-		closers = append(closers, c.agentChannel)
-		c.agentChannel = nil
-	}
+	//if c.agentChannel != nil {
+	//	closers = append(closers, c.agentChannel)
+	//	c.agentChannel = nil
+	//}
 	closers = append(closers, c.closers...)
 	c.closers = nil
 	return closers

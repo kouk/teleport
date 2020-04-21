@@ -352,8 +352,19 @@ func (s *SrvSuite) TestAgentForward(c *C) {
 	err = client.Close()
 	c.Assert(err, IsNil)
 
-	// make sure the socket is gone after we closed the session
-	se.Close()
+	// make sure the socket persists after the session is closed.
+	// (agents are started from specific sessions, but apply to all
+	// sessions on the connection).
+	err = se.Close()
+	c.Assert(err, IsNil)
+	time.Sleep(150 * time.Millisecond)
+	_, err = net.Dial("unix", socketPath)
+	c.Assert(err, IsNil)
+
+	// make sure the socket is gone after we closed the connection.
+	err = s.clt.Close()
+	c.Assert(err, IsNil)
+	s.clt = nil
 	for i := 0; i < 4; i++ {
 		_, err = net.Dial("unix", socketPath)
 		if err != nil {

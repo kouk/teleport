@@ -646,7 +646,7 @@ func (s *Server) handleChannel(nch ssh.NewChannel) {
 func (s *Server) handleDirectTCPIPRequest(ch ssh.Channel, req *sshutils.DirectTCPIPReq) {
 	// Create context for this channel. This context will be closed when
 	// forwarding is complete.
-	ctx, err := srv.NewServerContext(s, s.sconn, s.identityContext)
+	ctx, err := srv.NewServerContext(s, s.sconn, s.identityContext, nil)
 	if err != nil {
 		ctx.Errorf("Unable to create connection context: %v.", err)
 		ch.Stderr().Write([]byte("Unable to create connection context."))
@@ -713,7 +713,7 @@ func (s *Server) handleSessionRequests(ch ssh.Channel, in <-chan *ssh.Request) {
 	// There is no need for the forwarding server to initiate disconnects,
 	// based on teleport business logic, because this logic is already
 	// done on the server's terminating side.
-	ctx, err := srv.NewServerContext(s, s.sconn, s.identityContext)
+	ctx, err := srv.NewServerContext(s, s.sconn, s.identityContext, nil)
 	if err != nil {
 		ctx.Errorf("Unable to create connection context: %v.", err)
 		ch.Stderr().Write([]byte("Unable to create connection context."))
